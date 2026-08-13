@@ -1,0 +1,87 @@
+{
+  "name": "ai-dev-assistant",
+  "displayName": "AI Dev Assistant",
+  "description": "Continuous edge-case & business-logic checker for JS/TS and Java",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Linters", "Other"],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescriptreact",
+    "onLanguage:java"
+  ],
+  "main": "./out/extension.js",
+  "publisher": "ai-dev-assistant",
+  "packageManager": "pnpm@9.0.0",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiDevAssistant.analyzeFile",
+        "title": "AI Dev Assistant: Analyze Current File"
+      },
+      {
+        "command": "aiDevAssistant.clearCache",
+        "title": "AI Dev Assistant: Clear Analysis Cache"
+      }
+    ],
+    "configuration": {
+      "title": "AI Dev Assistant",
+      "properties": {
+        "aiDevAssistant.enableTier2": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable LLM-assisted Tier-2 analysis (requires API keys)"
+        },
+        "aiDevAssistant.llmTimeout": {
+          "type": "number",
+          "default": 5000,
+          "description": "Timeout in ms for LLM calls (default 5000)"
+        },
+        "aiDevAssistant.groqApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Groq API key for Tier-2 LLM analysis (primary provider)"
+        },
+        "aiDevAssistant.openRouterApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter API key for Tier-2 LLM analysis (fallback 1)"
+        },
+        "aiDevAssistant.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Google Gemini API key for Tier-2 LLM analysis (fallback 2)"
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "aiDevAssistant.devassistant",
+        "name": "devassistant",
+        "description": "Ask about edge cases and business-logic issues in your code",
+        "isSticky": false
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run compile",
+    "compile": "tsc -p ./tsconfig.json",
+    "watch": "tsc -watch -p ./tsconfig.json",
+    "pretest": "pnpm run compile",
+    "test": "node ./out/test/runTest.js",
+    "harness": "ts-node --project tsconfig.scripts.json scripts/pipeline-dev.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.3.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "java-parser": "^3.0.1",
+    "ts-morph": "^21.0.0"
+  }
+}

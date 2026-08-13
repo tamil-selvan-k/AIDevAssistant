@@ -1,0 +1,7 @@
+out/
+node_modules/
+*.vsix
+.env
+.claude/
+CLAUDE.md
+AI_Dev_Assistant_Project_Doc (1).pdf
