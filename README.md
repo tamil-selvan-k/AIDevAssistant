@@ -16,7 +16,7 @@ Runs synchronously on every save. Detects:
 - Java: `String ==` reference comparison instead of `.equals()`
 
 ### Tier-2 — LLM business-logic analysis (requires API key)
-Fires after Tier-1 for functions that contain business-logic keywords. Detects:
+Fires after Tier-1 **only for functions that passed Tier-1 cleanly** (no static violations found). If Tier-1 already flagged a function, the LLM call is skipped entirely — saving API quota and latency. Detects:
 - **Value-invariant bugs** — inputs that produce mathematically impossible outputs (e.g. discount > 100% → negative price)
 - **State-invariant bugs** — illegal state transitions (e.g. `refunded → shipped`)
 - Missing range/bound checks on business parameters
@@ -154,8 +154,9 @@ src/
 2. AST diff isolates changed functions
 3. Tier-1 rules run synchronously → squiggles render immediately
 4. `InterestFilter` checks if changed functions qualify for Tier-2
-5. Hash cache lookup — LLM skipped on hit
-6. On miss: Groq → OpenRouter → Gemini with 5s timeout per provider
+5. **Functions with Tier-1 violations are excluded from Tier-2** — no LLM call made
+6. Hash cache lookup — LLM skipped on hit
+7. On miss: Groq → OpenRouter → Gemini with 5s timeout per provider
 7. Structured JSON response mapped to `vscode.Diagnostic[]`
 8. Result cached; Tier-2 squiggles added to Problems panel
 

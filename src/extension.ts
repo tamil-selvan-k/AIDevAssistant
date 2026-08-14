@@ -110,8 +110,10 @@ async function analyzeDocument(
 
   // ── Tier-1: recompute for ALL current functions so stale/deleted fns are dropped ──
   const tier1Diagnostics: vscode.Diagnostic[] = [];
+  const tier1HitsByHash = new Map<string, number>(); // hash → violation count
   for (const fn of parseResult.functions) {
     const violations = runRulesByLanguage(doc.languageId, fn, doc.fileName);
+    tier1HitsByHash.set(fn.hash, violations.length);
     tier1Diagnostics.push(...mapRuleViolationsToDiagnostics(violations, doc));
   }
   out.appendLine(`[${label}] Tier-1: ${tier1Diagnostics.length} diagnostic(s)`);
@@ -156,6 +158,11 @@ async function analyzeDocument(
   }
 
   for (const fn of interesting) {
+    if ((tier1HitsByHash.get(fn.hash) ?? 0) > 0) {
+      out.appendLine(`[${label}] Tier-2 skipped for '${fn.name}': Tier-1 already flagged ${tier1HitsByHash.get(fn.hash)} issue(s)`);
+      continue;
+    }
+
     const cached = hashCache.get(fn.hash);
     if (cached) {
       out.appendLine(`[${label}] Tier-2 cache HIT for '${fn.name}'`);

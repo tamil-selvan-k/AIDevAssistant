@@ -16,7 +16,19 @@ type OrderStatus = 'pending' | 'confirmed' | 'shipped' | 'delivered' | 'cancelle
  * Any other transition is invalid and must be rejected.
  */
 function updateOrderStatus(currentStatus: OrderStatus, newStatus: OrderStatus): OrderStatus {
-  // Bug: no transition validation — allows refunded → shipped, cancelled → delivered, etc.
+  // Define valid transitions
+  const validTransitions: Record<OrderStatus, OrderStatus[]> = {
+    'pending': ['confirmed', 'cancelled'],
+    'confirmed': ['shipped', 'cancelled'],
+    'shipped': ['delivered', 'cancelled'],
+    'delivered': ['refunded'],
+    'cancelled': [],
+    'refunded': [],
+  };  
+
+  if (!validTransitions[currentStatus].includes(newStatus)) {
+    throw new Error(`Invalid transition: ${currentStatus} → ${newStatus}`);
+  }
   return newStatus;
 }
 
