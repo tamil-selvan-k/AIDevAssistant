@@ -18,6 +18,7 @@ import { GroqProvider } from '../src/providers/groq';
 import { OpenRouterProvider } from '../src/providers/openRouter';
 import { GeminiProvider } from '../src/providers/gemini';
 import { LLMProvider, LLMResponse } from '../src/providers/llmProvider';
+import { hasAnyApiKey, loadApiKeysFromDotEnvFile } from '../src/providers/apiKeyEnv';
 import { ParsedFunction } from '../src/tier1/astParser';
 import { RuleViolation } from '../src/tier1/ruleEngine';
 
@@ -143,8 +144,12 @@ async function main(): Promise<void> {
   console.log('AI Dev Assistant — Pipeline Dev Harness (JS/TS + Java)');
   console.log('Testing all 4 demo scenarios\n');
 
-  const hasAnyKey = process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY;
-  if (!hasAnyKey) {
+  const loadedFromDotEnv = loadApiKeysFromDotEnvFile(path.join(process.cwd(), '.env'));
+  if (loadedFromDotEnv.length > 0) {
+    console.log(`Loaded API keys from .env: ${loadedFromDotEnv.join(', ')}`);
+  }
+
+  if (!hasAnyApiKey()) {
     console.warn('WARNING: No API keys set. Tier-2 calls will fail.\n');
     console.warn('Set: GROQ_API_KEY, OPENROUTER_API_KEY, or GEMINI_API_KEY\n');
   }

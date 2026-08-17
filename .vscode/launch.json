@@ -12,12 +12,8 @@
       "outFiles": [
         "${workspaceFolder}/out/**/*.js"
       ],
-      "preLaunchTask": "${defaultBuildTask}",
-      "env": {
-        "GROQ_API_KEY": "${env:GROQ_API_KEY}",
-        "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}",
-        "GEMINI_API_KEY": "${env:GEMINI_API_KEY}"
-      }
+      "envFile": "${workspaceFolder}/.env",
+      "preLaunchTask": "${defaultBuildTask}"
     }
   ]
 }
