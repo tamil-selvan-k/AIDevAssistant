@@ -1,7 +1,7 @@
 import { LLMProvider, LLMResponse } from './llmProvider';
 import { geminiLimiter } from './rateLimiter';
 
-const GEMINI_MODEL = 'gemini-1.5-flash';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 export class GeminiProvider implements LLMProvider {
   readonly name = 'gemini';

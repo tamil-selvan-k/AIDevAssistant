@@ -15,7 +15,7 @@ function applyDiscount(price: number, discountPercent: number): number {
   if (discountPercent > 100) {
     throw new Error('Discount percentage cannot exceed 100%');
   }
-  return price - (price * discountPercent) / 100;
+  return price - (price * discountPercent) /100;
 }
 
 export { applyDiscount };
