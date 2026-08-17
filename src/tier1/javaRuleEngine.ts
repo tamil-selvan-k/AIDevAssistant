@@ -12,6 +12,13 @@ export function runJavaRules(fn: ParsedFunction): RuleViolation[] {
   checkStringEqualityWithDoubleEquals(fn, lines, violations);
   checkOffByOneLoops(fn, lines, violations);
   checkUnvalidatedParams(fn, violations);
+  checkEmptyCatch(fn, lines, violations);
+  checkResourceLeak(fn, lines, violations);
+  checkInstanceofBeforeCast(fn, lines, violations);
+  checkStringConcatInLoop(fn, lines, violations);
+  checkBroadCatch(fn, lines, violations);
+  checkStaticMutableField(fn, lines, violations);
+  checkSystemExit(fn, lines, violations);
 
   return violations;
 }
@@ -215,4 +222,237 @@ function checkUnvalidatedParams(fn: ParsedFunction, violations: RuleViolation[])
       suggestedFix: `Validate parameters at the top of the method (null checks, range checks)`,
     });
   }
+}
+
+function checkEmptyCatch(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  // Track state per catch block with explicit phases:
+  //   0 = looking for catch keyword
+  //   1 = catch found, looking for opening brace
+  //   2 = inside catch body, counting braces
+  let phase = 0;
+  let depth = 0;
+  let catchLine = 0;
+  let bodyLines = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { continue; }
+
+    if (phase === 0 && /\bcatch\s*\(/.test(trimmed)) {
+      phase = 1;
+      catchLine = i;
+      depth = 0;
+      bodyLines = 0;
+    }
+
+    if (phase >= 1) {
+      for (const ch of trimmed) {
+        if (ch === '{') {
+          depth++;
+          if (phase === 1) { phase = 2; } // entered body
+        } else if (ch === '}' && phase === 2) {
+          depth--;
+          if (depth === 0) {
+            // Catch block closed — count content lines (exclude the closing brace line itself)
+            if (bodyLines === 0) {
+              violations.push({
+                line: absLine(fn, catchLine + 1),
+                endLine: absLine(fn, i + 1),
+                message: `Empty catch block silently swallows exceptions — errors will go undetected`,
+                severity: 'warning',
+                ruleId: 'java-empty-catch',
+                suggestedFix: `At minimum log: logger.error("Unexpected error", e) or rethrow`,
+              });
+            }
+            phase = 0;
+          }
+        }
+      }
+      // Count non-empty, non-brace-only body lines
+      if (phase === 2 && depth > 0) {
+        const content = trimmed.replace(/[{}]/g, '').trim();
+        if (content.length > 0) { bodyLines++; }
+      }
+    }
+  }
+}
+
+function checkResourceLeak(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  // Resources that must be closed — flag if opened outside try-with-resources
+  const resourcePatterns: { pattern: RegExp; name: string }[] = [
+    { pattern: /new\s+FileInputStream\s*\(/, name: 'FileInputStream' },
+    { pattern: /new\s+FileOutputStream\s*\(/, name: 'FileOutputStream' },
+    { pattern: /new\s+BufferedReader\s*\(/, name: 'BufferedReader' },
+    { pattern: /new\s+BufferedWriter\s*\(/, name: 'BufferedWriter' },
+    { pattern: /new\s+PrintWriter\s*\(/, name: 'PrintWriter' },
+    { pattern: /new\s+InputStreamReader\s*\(/, name: 'InputStreamReader' },
+    { pattern: /new\s+Scanner\s*\(/, name: 'Scanner' },
+    { pattern: /DriverManager\.getConnection\s*\(/, name: 'Connection (DriverManager.getConnection)' },
+  ];
+
+  lines.forEach((line, i) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { return; }
+
+    // try-with-resources opens with `try (` — the resource is safely managed
+    if (/^\s*try\s*\(/.test(line)) { return; }
+
+    for (const { pattern, name } of resourcePatterns) {
+      if (pattern.test(trimmed)) {
+        violations.push({
+          line: absLine(fn, i + 1),
+          endLine: absLine(fn, i + 1),
+          message: `${name} opened outside try-with-resources — resource may not be closed on exception`,
+          severity: 'warning',
+          ruleId: 'java-resource-leak',
+          suggestedFix: `Use try-with-resources: try (${name} x = new ${name}(...)) { ... }`,
+        });
+      }
+    }
+  });
+}
+
+function checkInstanceofBeforeCast(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  lines.forEach((line, i) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { return; }
+
+    // Match explicit casts like (SomeType) expr — exclude primitive casts (int, long, double, float, char, byte, short)
+    const castMatch = trimmed.match(/\(([A-Z][a-zA-Z0-9_<>,\s]*)\)\s*([a-zA-Z_]\w*)/);
+    if (!castMatch) { return; }
+
+    const castType = castMatch[1].trim();
+    const castTarget = castMatch[2];
+
+    // Skip primitive-ish types
+    if (/^(int|long|double|float|char|byte|short|boolean|String)$/.test(castType)) { return; }
+
+    // Check if there's an instanceof for this type above (within 8 lines)
+    const hasInstanceof = isInstanceofCheckedAbove(lines, i, castType, castTarget);
+    if (!hasInstanceof) {
+      violations.push({
+        line: absLine(fn, i + 1),
+        endLine: absLine(fn, i + 1),
+        message: `Cast to '${castType}' without preceding instanceof check — ClassCastException risk`,
+        severity: 'warning',
+        ruleId: 'java-instanceof-cast',
+        suggestedFix: `Add: if (${castTarget} instanceof ${castType}) before casting, or use pattern matching (Java 16+)`,
+      });
+    }
+  });
+}
+
+function isInstanceofCheckedAbove(lines: string[], lineIdx: number, type: string, varName: string): boolean {
+  for (let i = lineIdx - 1; i >= Math.max(0, lineIdx - 8); i--) {
+    const t = lines[i].trim();
+    if (t.includes(`instanceof ${type}`) || t.includes(`instanceof(${type})`)) { return true; }
+    if (t.includes(`${varName} instanceof`)) { return true; }
+  }
+  return false;
+}
+
+function checkStringConcatInLoop(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  let loopDepth = 0;
+  let loopStartLine = -1;
+
+  lines.forEach((line, i) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { return; }
+
+    // Track loop entry
+    if (/^\s*(for|while)\s*\(/.test(line)) {
+      if (loopDepth === 0) { loopStartLine = i; }
+      loopDepth++;
+    }
+
+    // Count braces to track loop exit (rough approximation)
+    for (const ch of trimmed) {
+      if (ch === '{' && loopDepth > 0 && i > loopStartLine) { /* already inside */ }
+      if (ch === '}' && loopDepth > 0 && i > loopStartLine) { loopDepth = Math.max(0, loopDepth - 1); }
+    }
+
+    // Inside a loop: flag String += or String = x + "..."
+    if (loopDepth > 0) {
+      const isConcatAssign = /\bString\b.*\+=/.test(trimmed) ||
+        /[a-zA-Z_]\w*\s*\+=\s*"/.test(trimmed) ||
+        /[a-zA-Z_]\w*\s*=\s*[a-zA-Z_]\w*\s*\+\s*"/.test(trimmed) ||
+        /[a-zA-Z_]\w*\s*=\s*"[^"]*"\s*\+/.test(trimmed);
+
+      if (isConcatAssign) {
+        violations.push({
+          line: absLine(fn, i + 1),
+          endLine: absLine(fn, i + 1),
+          message: `String concatenation inside a loop creates O(n²) garbage — use StringBuilder`,
+          severity: 'warning',
+          ruleId: 'java-string-concat-loop',
+          suggestedFix: `Replace with StringBuilder: StringBuilder sb = new StringBuilder(); then sb.append(...)`,
+        });
+      }
+    }
+  });
+}
+
+function checkBroadCatch(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  lines.forEach((line, i) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { return; }
+
+    // catch (Exception e) or catch (Throwable e) — too broad
+    if (/\bcatch\s*\(\s*(Exception|Throwable)\s+\w+\s*\)/.test(trimmed)) {
+      violations.push({
+        line: absLine(fn, i + 1),
+        endLine: absLine(fn, i + 1),
+        message: `Catching '${/catch\s*\(\s*(\w+)/.exec(trimmed)?.[1] ?? 'Exception'}' is too broad — it swallows unexpected errors including OutOfMemoryError`,
+        severity: 'warning',
+        ruleId: 'java-broad-catch',
+        suggestedFix: `Catch the most specific exception type(s) instead`,
+      });
+    }
+  });
+}
+
+function checkStaticMutableField(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  lines.forEach((line, i) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { return; }
+
+    // public static <type> field (without 'final') inside method bodies is odd;
+    // this mainly catches class-level declarations included in the snippet.
+    // Match: public static [type] [name] (no 'final' keyword present on that line)
+    if (/\bpublic\s+static\b/.test(trimmed) &&
+        !/\bfinal\b/.test(trimmed) &&
+        !/\bvoid\b/.test(trimmed) &&            // skip method declarations
+        /[;=]/.test(trimmed)) {                 // field-like line (ends with ; or has =)
+      violations.push({
+        line: absLine(fn, i + 1),
+        endLine: absLine(fn, i + 1),
+        message: `Non-final public static field is shared mutable state — thread-safety and encapsulation risk`,
+        severity: 'warning',
+        ruleId: 'java-static-mutable-field',
+        suggestedFix: `Add 'final', or make the field private with a controlled accessor, or use an immutable type`,
+      });
+    }
+  });
+}
+
+function checkSystemExit(fn: ParsedFunction, lines: string[], violations: RuleViolation[]): void {
+  // Skip if this is the 'main' method — System.exit() is acceptable there
+  const simpleName = fn.name.includes('.') ? fn.name.split('.').pop()! : fn.name;
+  if (simpleName === 'main') { return; }
+
+  lines.forEach((line, i) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) { return; }
+
+    if (/\bSystem\.exit\s*\(/.test(trimmed)) {
+      violations.push({
+        line: absLine(fn, i + 1),
+        endLine: absLine(fn, i + 1),
+        message: `System.exit() in non-main code forcibly terminates the JVM — callers and shutdown hooks are bypassed`,
+        severity: 'error',
+        ruleId: 'java-system-exit',
+        suggestedFix: `Throw a specific exception instead, and let the top-level entry point decide whether to exit`,
+      });
+    }
+  });
 }

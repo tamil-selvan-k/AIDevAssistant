@@ -18,6 +18,7 @@ import { GroqProvider } from '../src/providers/groq';
 import { OpenRouterProvider } from '../src/providers/openRouter';
 import { GeminiProvider } from '../src/providers/gemini';
 import { LLMProvider, LLMResponse } from '../src/providers/llmProvider';
+import { hasAnyApiKey, loadApiKeysFromDotEnvFile } from '../src/providers/apiKeyEnv';
 import { ParsedFunction } from '../src/tier1/astParser';
 import { RuleViolation } from '../src/tier1/ruleEngine';
 
@@ -101,14 +102,14 @@ async function runScenario(scenario: Scenario): Promise<void> {
       continue;
     }
 
-    const ctx = buildContext(fn);
+    const ctx = buildContext(fn, filePath, sourceText);
     const prompt = buildPrompt(ctx);
 
-    console.log('\n[4] Built prompt (first 300 chars):');
+    console.log(`\n[4] Built prompt (${ctx.callees.length} callee(s), first 300 chars):`);
     console.log('    ' + prompt.slice(0, 300).replace(/\n/g, '\n    ') + '...');
 
     console.log('\n[5] Checking hash cache...');
-    const cached = hashCache.get(fn.hash);
+    const cached = hashCache.get(ctx.compositeHash);
     if (cached) {
       console.log('    CACHE HIT');
       printLLMResult(cached);
@@ -118,7 +119,7 @@ async function runScenario(scenario: Scenario): Promise<void> {
 
     try {
       const result = await callWithFallback(prompt);
-      hashCache.set(fn.hash, result);
+      hashCache.set(ctx.compositeHash, result);
       console.log('\n[6] LLM response:');
       printLLMResult(result);
     } catch (err) {
@@ -143,8 +144,12 @@ async function main(): Promise<void> {
   console.log('AI Dev Assistant — Pipeline Dev Harness (JS/TS + Java)');
   console.log('Testing all 4 demo scenarios\n');
 
-  const hasAnyKey = process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY;
-  if (!hasAnyKey) {
+  const loadedFromDotEnv = loadApiKeysFromDotEnvFile(path.join(process.cwd(), '.env'));
+  if (loadedFromDotEnv.length > 0) {
+    console.log(`Loaded API keys from .env: ${loadedFromDotEnv.join(', ')}`);
+  }
+
+  if (!hasAnyApiKey()) {
     console.warn('WARNING: No API keys set. Tier-2 calls will fail.\n');
     console.warn('Set: GROQ_API_KEY, OPENROUTER_API_KEY, or GEMINI_API_KEY\n');
   }

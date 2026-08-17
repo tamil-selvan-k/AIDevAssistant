@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { diffFunctions, ParsedFunction } from './tier1/astParser';
 import { mapRuleViolationsToDiagnostics, mapLLMIssuesToDiagnostics } from './tier1/diagnosticMapper';
 import { isSupportedLanguage, parseByLanguage, runRulesByLanguage } from './tier1/languageAdapter';
@@ -6,41 +7,53 @@ import { isInteresting } from './tier2/interestFilter';
 import { buildContext } from './tier2/contextBuilder';
 import { buildPrompt } from './tier2/promptTemplate';
 import * as hashCache from './tier2/hashCache';
-import { callWithFallback } from './tier2/orchestrator';
+import { callWithFallback, setLogger } from './tier2/orchestrator';
 import { registerChatParticipant } from './chat/chatParticipant';
+import { API_KEY_ENV_VARS, loadApiKeysFromDotEnvFile } from './providers/apiKeyEnv';
 
 const prevFunctionMap = new Map<string, ParsedFunction[]>();
 const llmDiagnosticsByHash = new Map<string, Map<string, vscode.Diagnostic[]>>();
+let apiKeysReady: Promise<void> = Promise.resolve();
 
 export let out: vscode.OutputChannel;
 
-export function activate(context: vscode.ExtensionContext): void {
+// All known rule IDs across TS/JS and Java — used by the listRuleIds command.
+const ALL_RULE_IDS = [
+  // TS/JS
+  'null-access', 'array-bounds', 'division-by-zero', 'unhandled-promise',
+  'loose-equality', 'off-by-one', 'unvalidated-params', 'empty-catch',
+  'async-no-await', 'infinite-loop', 'typeof-null', 'switch-no-default',
+  'arguments-in-arrow', 'promise-no-catch',
+  // Java
+  'java-null-deref', 'java-array-bounds', 'java-division-by-zero',
+  'java-unchecked-exception', 'java-string-equals', 'java-off-by-one',
+  'java-unvalidated-params', 'java-empty-catch', 'java-resource-leak',
+  'java-instanceof-cast', 'java-string-concat-loop',
+  'java-broad-catch', 'java-static-mutable-field', 'java-system-exit',
+];
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // ── SYNCHRONOUS SETUP — must complete before any await ──────────────────────
+  // Anything registered here is guaranteed to work even if the async key-loading
+  // below fails. VS Code invokes the chat participant handler as soon as activate()
+  // resolves, so we register it first.
+
   out = vscode.window.createOutputChannel('AI Dev Assistant');
   context.subscriptions.push(out);
-  out.show(true); // open Output panel on activation
+  out.show(true);
+
+  // Route orchestrator logs to the Output channel so provider failures are visible
+  setLogger(msg => out.appendLine(msg));
 
   const diagnosticCollection = vscode.languages.createDiagnosticCollection('ai-dev-assistant');
   context.subscriptions.push(diagnosticCollection);
 
-  // Inject API keys from VS Code settings into process.env (env vars take precedence)
-  const cfg = vscode.workspace.getConfiguration('aiDevAssistant');
-  if (!process.env.GROQ_API_KEY) {
-    const k = cfg.get<string>('groqApiKey');
-    if (k) { process.env.GROQ_API_KEY = k; }
-  }
-  if (!process.env.OPENROUTER_API_KEY) {
-    const k = cfg.get<string>('openRouterApiKey');
-    if (k) { process.env.OPENROUTER_API_KEY = k; }
-  }
-  if (!process.env.GEMINI_API_KEY) {
-    const k = cfg.get<string>('geminiApiKey');
-    if (k) { process.env.GEMINI_API_KEY = k; }
-  }
+  hashCache.initPersistence(context.globalState);
+  apiKeysReady = initializeApiKeys(context);
 
-  out.appendLine('AI Dev Assistant activated');
-  out.appendLine(`  GROQ_API_KEY: ${process.env.GROQ_API_KEY ? 'SET (' + process.env.GROQ_API_KEY.slice(0, 6) + '…)' : 'NOT SET'}`);
-  out.appendLine(`  OPENROUTER_API_KEY: ${process.env.OPENROUTER_API_KEY ? 'SET' : 'NOT SET'}`);
-  out.appendLine(`  GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'SET' : 'NOT SET'}`);
+  // Register the chat participant before any await — this is the most common
+  // activation path when the user types @devassistant in chat.
+  registerChatParticipant(context);
 
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(doc => {
@@ -83,11 +96,94 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  registerChatParticipant(context);
+  context.subscriptions.push(
+    vscode.commands.registerCommand('aiDevAssistant.storeApiKey', async () => {
+      const provider = await vscode.window.showQuickPick(
+        ['Groq (primary)', 'OpenRouter (fallback 1)', 'Gemini (fallback 2)'],
+        { placeHolder: 'Which API key do you want to store securely?' }
+      );
+      if (!provider) { return; }
 
+      const secretId = provider.startsWith('Groq')
+        ? 'aiDevAssistant.groqApiKey'
+        : provider.startsWith('OpenRouter')
+          ? 'aiDevAssistant.openRouterApiKey'
+          : 'aiDevAssistant.geminiApiKey';
+
+      const envVar = provider.startsWith('Groq') ? 'GROQ_API_KEY'
+        : provider.startsWith('OpenRouter') ? 'OPENROUTER_API_KEY' : 'GEMINI_API_KEY';
+
+      const key = await vscode.window.showInputBox({
+        prompt: `Paste your ${provider} API key`,
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (!key) { return; }
+
+      await context.secrets.store(secretId, key);
+      process.env[envVar] = key;
+      vscode.window.showInformationMessage(`AI Dev Assistant: ${provider} key stored securely.`);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('aiDevAssistant.listRuleIds', () => {
+      out.show(true);
+      out.appendLine('\n── Available Rule IDs ──────────────────────────────');
+      for (const id of ALL_RULE_IDS) { out.appendLine(`  ${id}`); }
+      out.appendLine('Add any of these to aiDevAssistant.disabledRules to suppress them.');
+    })
+  );
+
+  await apiKeysReady;
+
+  // Kick off analysis for already-open files after API key initialization so
+  // the very first Tier-2 pass does not fail from startup key race conditions.
   for (const doc of vscode.workspace.textDocuments) {
     if (isSupportedLanguage(doc.languageId)) {
       analyzeDocument(doc, diagnosticCollection).catch(console.error);
+    }
+  }
+
+  out.appendLine('AI Dev Assistant activated');
+  out.appendLine(`  GROQ_API_KEY:       ${process.env.GROQ_API_KEY        ? 'SET (' + process.env.GROQ_API_KEY.slice(0, 6) + '…)' : 'NOT SET'}`);
+  out.appendLine(`  OPENROUTER_API_KEY: ${process.env.OPENROUTER_API_KEY  ? 'SET' : 'NOT SET'}`);
+  out.appendLine(`  GEMINI_API_KEY:     ${process.env.GEMINI_API_KEY      ? 'SET' : 'NOT SET'}`);
+  out.appendLine(`  LLM cache size:     ${hashCache.size()} entry(ies) restored`);
+}
+
+async function initializeApiKeys(context: vscode.ExtensionContext): Promise<void> {
+  const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+  for (const folder of workspaceFolders) {
+    const dotEnvPath = path.join(folder.uri.fsPath, '.env');
+    const loaded = loadApiKeysFromDotEnvFile(dotEnvPath);
+    if (loaded.length > 0) {
+      out.appendLine(`[AI Dev Assistant] Loaded from .env (${path.basename(folder.uri.fsPath)}): ${loaded.join(', ')}`);
+    }
+  }
+
+  const cfg = vscode.workspace.getConfiguration('aiDevAssistant');
+  const secretKeys: Array<[string, (typeof API_KEY_ENV_VARS)[number], string]> = [
+    ['aiDevAssistant.groqApiKey', 'GROQ_API_KEY', 'groqApiKey'],
+    ['aiDevAssistant.openRouterApiKey', 'OPENROUTER_API_KEY', 'openRouterApiKey'],
+    ['aiDevAssistant.geminiApiKey', 'GEMINI_API_KEY', 'geminiApiKey'],
+  ];
+
+  for (const [secretId, envVar, settingKey] of secretKeys) {
+    if (process.env[envVar]) { continue; }
+    try {
+      const fromSecret = await context.secrets.get(secretId);
+      if (fromSecret) {
+        process.env[envVar] = fromSecret;
+        continue;
+      }
+    } catch (err) {
+      out.appendLine(`[Warning] Failed reading secret '${secretId}': ${(err as Error).message}`);
+    }
+
+    const fromSetting = cfg.get<string>(settingKey);
+    if (fromSetting) {
+      process.env[envVar] = fromSetting;
     }
   }
 }
@@ -108,11 +204,15 @@ async function analyzeDocument(
   prevFunctionMap.set(doc.fileName, parseResult.functions);
   out.appendLine(`[${label}] changed: ${changed.length} (${changed.map(f => f.name).join(', ') || 'none'})`);
 
+  const config = vscode.workspace.getConfiguration('aiDevAssistant');
+  const disabledRules = config.get<string[]>('disabledRules') ?? [];
+
   // ── Tier-1: recompute for ALL current functions so stale/deleted fns are dropped ──
   const tier1Diagnostics: vscode.Diagnostic[] = [];
-  const tier1HitsByHash = new Map<string, number>(); // hash → violation count
+  const tier1HitsByHash = new Map<string, number>();
   for (const fn of parseResult.functions) {
-    const violations = runRulesByLanguage(doc.languageId, fn, doc.fileName);
+    const violations = runRulesByLanguage(doc.languageId, fn, doc.fileName)
+      .filter(v => !disabledRules.includes(v.ruleId));
     tier1HitsByHash.set(fn.hash, violations.length);
     tier1Diagnostics.push(...mapRuleViolationsToDiagnostics(violations, doc));
   }
@@ -140,7 +240,8 @@ async function analyzeDocument(
     return;
   }
 
-  const config = vscode.workspace.getConfiguration('aiDevAssistant');
+  await apiKeysReady;
+
   if (config.get<boolean>('enableTier2') === false) {
     out.appendLine(`[${label}] Tier-2 skipped: disabled in settings`);
     return;
@@ -157,31 +258,47 @@ async function analyzeDocument(
     return;
   }
 
+  // Cap open files — building a large ts-morph project is expensive
+  const maxFiles = config.get<number>('maxContextFiles') ?? 15;
+  const openFiles = vscode.workspace.textDocuments
+    .filter(d => d.fileName !== doc.fileName && /\.(ts|tsx|js|jsx)$/i.test(d.fileName))
+    .slice(0, maxFiles)
+    .map(d => ({ filePath: d.fileName, text: d.getText() }));
+
   for (const fn of interesting) {
     if ((tier1HitsByHash.get(fn.hash) ?? 0) > 0) {
       out.appendLine(`[${label}] Tier-2 skipped for '${fn.name}': Tier-1 already flagged ${tier1HitsByHash.get(fn.hash)} issue(s)`);
       continue;
     }
 
-    const cached = hashCache.get(fn.hash);
+    const ctx = buildContext(fn, doc.fileName, sourceText, openFiles);
+    out.appendLine(`[${label}] Tier-2 context for '${fn.name}': ${ctx.callees.length} callee(s) [${ctx.callees.map(c => c.name).join(', ') || 'none'}]`);
+
+    const cached = hashCache.get(ctx.compositeHash);
     if (cached) {
       out.appendLine(`[${label}] Tier-2 cache HIT for '${fn.name}'`);
+      if (cached.analysisNote) {
+        out.appendLine(`[${label}]   analysisNote: ${cached.analysisNote}`);
+      }
       llmStore.set(fn.hash, mapLLMIssuesToDiagnostics(cached.issues, doc, fn.startLine));
       publishDiagnostics();
       continue;
     }
 
     out.appendLine(`[${label}] Tier-2 calling LLM for '${fn.name}'...`);
-    const prompt = buildPrompt(buildContext(fn));
+    const prompt = buildPrompt(ctx);
 
     try {
       const result = await callWithFallback(prompt, 5000);
       out.appendLine(`[${label}] Tier-2 LLM returned ${result.issues.length} issue(s) for '${fn.name}' (fnStartLine=${fn.startLine})`);
+      if (result.analysisNote) {
+        out.appendLine(`[${label}]   analysisNote: ${result.analysisNote}`);
+      }
       for (const iss of result.issues) {
         const abs = fn.startLine + iss.line - 2;
         out.appendLine(`[${label}]   → [${iss.severity}] fnLine=${iss.line} absLine0=${abs} | ${iss.message}`);
       }
-      hashCache.set(fn.hash, result);
+      hashCache.set(ctx.compositeHash, result);
       const mapped = mapLLMIssuesToDiagnostics(result.issues, doc, fn.startLine);
       out.appendLine(`[${label}]   mapped ${mapped.length} diagnostic(s) (doc.lineCount=${doc.lineCount})`);
       llmStore.set(fn.hash, mapped);
@@ -191,10 +308,13 @@ async function analyzeDocument(
       out.appendLine(`[${label}] Tier-2 FAILED for '${fn.name}': ${msg}`);
       const action = await vscode.window.showWarningMessage(
         `AI Dev Assistant: Tier-2 unavailable for '${fn.name}' — ${msg}`,
-        'Open Settings'
+        'Open Settings',
+        'Store API Key'
       );
       if (action === 'Open Settings') {
-        vscode.commands.executeCommand('workbench.action.openSettings', 'aiDevAssistant.groqApiKey');
+        vscode.commands.executeCommand('workbench.action.openSettings', 'aiDevAssistant');
+      } else if (action === 'Store API Key') {
+        vscode.commands.executeCommand('aiDevAssistant.storeApiKey');
       }
     }
   }
