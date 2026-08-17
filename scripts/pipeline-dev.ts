@@ -101,14 +101,14 @@ async function runScenario(scenario: Scenario): Promise<void> {
       continue;
     }
 
-    const ctx = buildContext(fn);
+    const ctx = buildContext(fn, filePath, sourceText);
     const prompt = buildPrompt(ctx);
 
-    console.log('\n[4] Built prompt (first 300 chars):');
+    console.log(`\n[4] Built prompt (${ctx.callees.length} callee(s), first 300 chars):`);
     console.log('    ' + prompt.slice(0, 300).replace(/\n/g, '\n    ') + '...');
 
     console.log('\n[5] Checking hash cache...');
-    const cached = hashCache.get(fn.hash);
+    const cached = hashCache.get(ctx.compositeHash);
     if (cached) {
       console.log('    CACHE HIT');
       printLLMResult(cached);
@@ -118,7 +118,7 @@ async function runScenario(scenario: Scenario): Promise<void> {
 
     try {
       const result = await callWithFallback(prompt);
-      hashCache.set(fn.hash, result);
+      hashCache.set(ctx.compositeHash, result);
       console.log('\n[6] LLM response:');
       printLLMResult(result);
     } catch (err) {

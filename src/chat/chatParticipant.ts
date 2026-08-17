@@ -63,12 +63,24 @@ async function handleChatRequest(
   const langLabel = doc.languageId === 'java' ? 'Java' : 'JS/TS';
   stream.markdown(`Found **${parseResult.functions.length}** ${langLabel} function(s). Running analysis...\n\n`);
 
+  const config = vscode.workspace.getConfiguration('aiDevAssistant');
+  const disabledRules = config.get<string[]>('disabledRules') ?? [];
+  const maxFiles = config.get<number>('maxContextFiles') ?? 15;
+
+  // Full source text (not just selection) — needed for callee resolution
+  const fullSourceText = doc.getText();
+  const openFiles = vscode.workspace.textDocuments
+    .filter(d => d.fileName !== doc.fileName && /\.(ts|tsx|js|jsx)$/i.test(d.fileName))
+    .slice(0, maxFiles)
+    .map(d => ({ filePath: d.fileName, text: d.getText() }));
+
   for (const fn of parseResult.functions) {
     if (token.isCancellationRequested) { break; }
 
     stream.markdown(`---\n### \`${fn.name}\` (line ${fn.startLine})\n\n`);
 
-    const tier1Violations = runRulesByLanguage(doc.languageId, fn, doc.fileName);
+    const tier1Violations = runRulesByLanguage(doc.languageId, fn, doc.fileName)
+      .filter(v => !disabledRules.includes(v.ruleId));
 
     if (tier1Violations.length > 0) {
       stream.markdown('**Tier-1 Static Issues:**\n');
@@ -84,16 +96,18 @@ async function handleChatRequest(
     if (isInteresting(fn)) {
       stream.markdown('**Tier-2 LLM Analysis** (business logic)...\n\n');
 
-      const cached = hashCache.get(fn.hash);
+      // Build context (includes callee resolution) to get the compositeHash for cache key
+      const ctx = buildContext(fn, doc.fileName, fullSourceText, openFiles);
+
+      const cached = hashCache.get(ctx.compositeHash);
       if (cached) {
         stream.markdown('*(from cache)*\n\n');
         renderLLMIssues(stream, cached.issues);
       } else {
-        const ctx = buildContext(fn);
         const prompt = buildPrompt(ctx);
         try {
           const result = await callWithFallback(prompt, 5000);
-          hashCache.set(fn.hash, result);
+          hashCache.set(ctx.compositeHash, result);
           renderLLMIssues(stream, result.issues);
         } catch (err) {
           stream.markdown(`> Tier-2 analysis unavailable: ${(err as Error).message}\n\n`);

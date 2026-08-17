@@ -1,4 +1,4 @@
-import { Project, Node, SyntaxKind } from 'ts-morph';
+import { Project, Node, SyntaxKind, SourceFile } from 'ts-morph';
 import { ParsedFunction } from './astParser';
 
 export interface RuleViolation {
@@ -10,9 +10,25 @@ export interface RuleViolation {
   suggestedFix: string;
 }
 
-export function runRules(fn: ParsedFunction, filePath: string): RuleViolation[] {
-  const project = new Project({ useInMemoryFileSystem: true, compilerOptions: { allowJs: true } });
-  const sourceFile = project.createSourceFile(filePath, fn.text);
+// Shared Project singleton — avoids re-initialising the TS language service for every function.
+// All Tier-1 rule checks are synchronous (no await) so there is no concurrency conflict.
+let _sharedProject: Project | undefined;
+const SNIPPET_PATH = '/_snippet_.ts';
+
+function getSnippetSourceFile(text: string): SourceFile {
+  if (!_sharedProject) {
+    _sharedProject = new Project({ useInMemoryFileSystem: true, compilerOptions: { allowJs: true } });
+  }
+  const existing = _sharedProject.getSourceFile(SNIPPET_PATH);
+  if (existing) {
+    existing.replaceWithText(text);
+    return existing;
+  }
+  return _sharedProject.createSourceFile(SNIPPET_PATH, text);
+}
+
+export function runRules(fn: ParsedFunction, _filePath: string): RuleViolation[] {
+  const sourceFile = getSnippetSourceFile(fn.text);
   const violations: RuleViolation[] = [];
 
   // ts-morph line numbers are 1-based; fn.startLine is 1-based.
@@ -30,12 +46,19 @@ export function runRules(fn: ParsedFunction, filePath: string): RuleViolation[] 
   checkLooseEquality(sourceFile, getLine, violations);
   checkOffByOneLoops(sourceFile, getLine, violations);
   checkUnvalidatedParams(fn, sourceFile, getLine, violations);
+  checkEmptyCatch(sourceFile, getLine, violations);
+  checkAsyncNoAwait(fn, sourceFile, getLine, violations);
+  checkInfiniteLoop(sourceFile, getLine, violations);
+  checkTypeofNull(sourceFile, getLine, violations);
+  checkSwitchNoDefault(sourceFile, getLine, violations);
+  checkArgumentsInArrow(sourceFile, getLine, violations);
+  checkPromiseNoCatch(sourceFile, getLine, violations);
 
   return violations;
 }
 
 function checkNullUndefinedAccess(
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -92,7 +115,7 @@ function isAncestorOf(ancestor: Node, descendant: Node): boolean {
 }
 
 function checkArrayBoundsAccess(
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -117,7 +140,7 @@ function checkArrayBoundsAccess(
 }
 
 function checkDivisionByZero(
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -142,7 +165,7 @@ function checkDivisionByZero(
 }
 
 function checkUnhandledPromise(
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -178,7 +201,7 @@ function checkUnhandledPromise(
 }
 
 function checkLooseEquality(
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -201,7 +224,7 @@ function checkLooseEquality(
 }
 
 function checkOffByOneLoops(
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -226,7 +249,7 @@ function checkOffByOneLoops(
 
 function checkUnvalidatedParams(
   fn: ParsedFunction,
-  sourceFile: ReturnType<typeof Project.prototype.createSourceFile>,
+  sourceFile: SourceFile,
   _getLine: (n: Node) => number,
   violations: RuleViolation[]
 ): void {
@@ -249,4 +272,189 @@ function checkUnvalidatedParams(
       suggestedFix: `Validate parameters at the top of the function (type checks, range checks, null checks)`,
     });
   }
+}
+
+function checkEmptyCatch(
+  sourceFile: SourceFile,
+  getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  sourceFile.getDescendantsOfKind(SyntaxKind.CatchClause).forEach(node => {
+    const block = node.getBlock();
+    if (block.getStatements().length === 0) {
+      violations.push({
+        line: getLine(node),
+        endLine: getLine(node),
+        message: `Empty catch block silently swallows exceptions — errors will go undetected`,
+        severity: 'warning',
+        ruleId: 'empty-catch',
+        suggestedFix: `At minimum log the error: console.error(e) or rethrow with context`,
+      });
+    }
+  });
+}
+
+function checkAsyncNoAwait(
+  fn: ParsedFunction,
+  sourceFile: SourceFile,
+  _getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  // Check if the snippet text starts an async function
+  const isAsync = /\basync\b/.test(fn.text);
+  if (!isAsync) { return; }
+
+  const hasAwait = sourceFile.getDescendantsOfKind(SyntaxKind.AwaitExpression).length > 0;
+  if (hasAwait) { return; }
+
+  // Exclude functions that use new Promise(...) — those are intentionally async without await
+  const hasNewPromise = fn.text.includes('new Promise');
+  if (hasNewPromise) { return; }
+
+  violations.push({
+    line: fn.startLine,
+    endLine: fn.startLine,
+    message: `Async function '${fn.name}' has no await — the async keyword is unnecessary and may signal a missing await`,
+    severity: 'warning',
+    ruleId: 'async-no-await',
+    suggestedFix: `Either add await before the async call, or remove the async keyword if not needed`,
+  });
+}
+
+function checkInfiniteLoop(
+  sourceFile: SourceFile,
+  getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  sourceFile.getDescendantsOfKind(SyntaxKind.WhileStatement).forEach(node => {
+    const expr = node.getExpression();
+    const exprText = expr.getText().trim();
+
+    // Only flag while(true) / while(1) — other conditions are too noisy
+    if (exprText !== 'true' && exprText !== '1') { return; }
+
+    const body = node.getStatement();
+    const bodyText = body.getText();
+
+    // If there's a break, return, or throw anywhere in the body the loop can exit
+    const hasExit = /\b(break|return|throw)\b/.test(bodyText);
+    if (!hasExit) {
+      violations.push({
+        line: getLine(node),
+        endLine: getLine(node),
+        message: `while(${exprText}) loop has no break, return, or throw — possible infinite loop`,
+        severity: 'error',
+        ruleId: 'infinite-loop',
+        suggestedFix: `Add a break/return condition or replace with a bounded loop`,
+      });
+    }
+  });
+}
+
+function checkTypeofNull(
+  sourceFile: SourceFile,
+  getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  sourceFile.getDescendantsOfKind(SyntaxKind.BinaryExpression).forEach(node => {
+    const op = node.getOperatorToken().getText();
+    if (op !== '===' && op !== '!==') { return; }
+
+    const left = node.getLeft();
+    const right = node.getRight();
+
+    const leftIsTypeof = Node.isTypeOfExpression(left);
+    const rightIsNullStr = Node.isStringLiteral(right) && right.getLiteralValue() === 'null';
+    const rightIsTypeof = Node.isTypeOfExpression(right);
+    const leftIsNullStr = Node.isStringLiteral(left) && left.getLiteralValue() === 'null';
+
+    if ((leftIsTypeof && rightIsNullStr) || (rightIsTypeof && leftIsNullStr)) {
+      violations.push({
+        line: getLine(node),
+        endLine: getLine(node),
+        message: `'typeof x === "null"' is always false — typeof never returns "null"; use '=== null' instead`,
+        severity: 'error',
+        ruleId: 'typeof-null',
+        suggestedFix: `Replace typeof check with a direct null comparison: x === null`,
+      });
+    }
+  });
+}
+
+function checkSwitchNoDefault(
+  sourceFile: SourceFile,
+  getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  sourceFile.getDescendantsOfKind(SyntaxKind.SwitchStatement).forEach(node => {
+    const hasDefault = node.getCaseBlock().getClauses()
+      .some(c => Node.isDefaultClause(c));
+    if (!hasDefault) {
+      violations.push({
+        line: getLine(node),
+        endLine: getLine(node),
+        message: `switch statement has no 'default' clause — unexpected values will silently fall through`,
+        severity: 'warning',
+        ruleId: 'switch-no-default',
+        suggestedFix: `Add 'default: throw new Error(\`Unexpected value: \${expr}\`)' to handle unrecognised cases`,
+      });
+    }
+  });
+}
+
+function checkArgumentsInArrow(
+  sourceFile: SourceFile,
+  getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  sourceFile.getDescendantsOfKind(SyntaxKind.ArrowFunction).forEach(arrow => {
+    arrow.getDescendantsOfKind(SyntaxKind.Identifier).forEach(id => {
+      if (id.getText() !== 'arguments') { return; }
+      violations.push({
+        line: getLine(id),
+        endLine: getLine(id),
+        message: `'arguments' is not available in arrow functions — it is always undefined here`,
+        severity: 'error',
+        ruleId: 'arguments-in-arrow',
+        suggestedFix: `Use rest parameters instead: (...args) => { ... }`,
+      });
+    });
+  });
+}
+
+function checkPromiseNoCatch(
+  sourceFile: SourceFile,
+  getLine: (n: Node) => number,
+  violations: RuleViolation[]
+): void {
+  sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression).forEach(node => {
+    const expr = node.getExpression();
+    if (!Node.isPropertyAccessExpression(expr)) { return; }
+    if (expr.getName() !== 'then') { return; }
+
+    const parent = node.getParent();
+
+    // Safe: chained with .catch() — parent is PropertyAccessExpression named 'catch'
+    if (Node.isPropertyAccessExpression(parent) && parent.getName() === 'catch') { return; }
+
+    // Safe: awaited
+    if (Node.isAwaitExpression(parent)) { return; }
+
+    // Safe: result returned to caller (caller handles the rejection)
+    if (Node.isReturnStatement(parent)) { return; }
+
+    // Safe: result assigned to a variable or passed as argument
+    if (Node.isVariableDeclaration(parent)) { return; }
+    if (Node.isCallExpression(parent)) { return; }
+    if (Node.isBinaryExpression(parent)) { return; }
+
+    violations.push({
+      line: getLine(node),
+      endLine: getLine(node),
+      message: `Promise .then() without .catch() — rejected promise will silently fail`,
+      severity: 'warning',
+      ruleId: 'promise-no-catch',
+      suggestedFix: `Chain .catch(err => console.error(err)) or wrap the caller with try/catch + await`,
+    });
+  });
 }

@@ -15,7 +15,8 @@
     "onLanguage:typescript",
     "onLanguage:javascriptreact",
     "onLanguage:typescriptreact",
-    "onLanguage:java"
+    "onLanguage:java",
+    "onChatParticipant:aiDevAssistant.devassistant"
   ],
   "main": "./out/extension.js",
   "publisher": "ai-dev-assistant",
@@ -29,6 +30,14 @@
       {
         "command": "aiDevAssistant.clearCache",
         "title": "AI Dev Assistant: Clear Analysis Cache"
+      },
+      {
+        "command": "aiDevAssistant.storeApiKey",
+        "title": "AI Dev Assistant: Store API Key (Secure)"
+      },
+      {
+        "command": "aiDevAssistant.listRuleIds",
+        "title": "AI Dev Assistant: List Rule IDs"
       }
     ],
     "configuration": {
@@ -41,23 +50,34 @@
         },
         "aiDevAssistant.llmTimeout": {
           "type": "number",
-          "default": 5000,
-          "description": "Timeout in ms for LLM calls (default 5000)"
+          "default": 15000,
+          "description": "Timeout in ms per LLM provider call (default 15000). Increase if you see timeout failures on large functions."
         },
         "aiDevAssistant.groqApiKey": {
           "type": "string",
           "default": "",
-          "description": "Groq API key for Tier-2 LLM analysis (primary provider)"
+          "description": "Groq API key (primary). Prefer using the 'AI Dev Assistant: Store API Key' command — that writes to VS Code's encrypted secret storage instead of plaintext settings."
         },
         "aiDevAssistant.openRouterApiKey": {
           "type": "string",
           "default": "",
-          "description": "OpenRouter API key for Tier-2 LLM analysis (fallback 1)"
+          "description": "OpenRouter API key (fallback 1). Prefer using the 'AI Dev Assistant: Store API Key' command for secure storage."
         },
         "aiDevAssistant.geminiApiKey": {
           "type": "string",
           "default": "",
-          "description": "Google Gemini API key for Tier-2 LLM analysis (fallback 2)"
+          "description": "Google Gemini API key (fallback 2). Prefer using the 'AI Dev Assistant: Store API Key' command for secure storage."
+        },
+        "aiDevAssistant.disabledRules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Rule IDs to suppress globally (e.g. [\"loose-equality\", \"unvalidated-params\"]). Run 'AI Dev Assistant: List Rule IDs' to see all available IDs."
+        },
+        "aiDevAssistant.maxContextFiles": {
+          "type": "number",
+          "default": 15,
+          "description": "Maximum number of open workspace files included in cross-file callee resolution for Tier-2 context. Lower this if activation is slow."
         }
       }
     },
